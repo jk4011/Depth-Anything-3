@@ -57,13 +57,13 @@ Homepage = "https://github.com/ByteDance-Seed/Depth-Anything-3"
 source = "vcs"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/depth_anything_3"]
+packages = ["depth_anything_3"]
 
 [tool.hatch.build.targets.sdist]
 include = [
   "/README.md",
   "/pyproject.toml",
-  "/src/depth_anything_3",
+  "/depth_anything_3",
 ]
 
 [tool.hatch.metadata]
