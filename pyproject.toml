@@ -49,6 +49,7 @@ all = ["depth-anything-3[app,gs]"]
 
 [project.scripts]
 da3 = "depth_anything_3.cli:app"
+da3_viser = "depth_anything_3.demo_viser:main"
 
 [project.urls]
 Homepage = "https://github.com/ByteDance-Seed/Depth-Anything-3"
