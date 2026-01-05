@@ -28,67 +28,15 @@ from depth_anything_3.da3_inference import da3_inference
 from depth_anything_3.utils.geometry import affine_inverse
 
 
-def unproject_depth_to_points(
-    depth: np.ndarray,
-    extrinsics: np.ndarray,
-    intrinsics: np.ndarray,
-) -> np.ndarray:
-    """
-    Unproject depth maps to 3D world points.
-
-    Args:
-        depth: Depth maps (N, H, W)
-        extrinsics: Camera extrinsics w2c (N, 3, 4)
-        intrinsics: Camera intrinsics (N, 3, 3)
-
-    Returns:
-        World points (N, H, W, 3)
-    """
-    N, H, W = depth.shape
-
-    # Create pixel coordinates
-    v, u = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
-    ones = np.ones_like(u)
-    pixels = np.stack([u, v, ones], axis=-1).astype(np.float32)  # (H, W, 3)
-
-    world_points = []
-    for i in range(N):
-        # Get camera parameters
-        K = intrinsics[i]  # (3, 3)
-        ext = extrinsics[i]  # (3, 4)
-
-        # Compute camera-to-world transform
-        R = ext[:3, :3]
-        t = ext[:3, 3:4]
-        # c2w = inv(w2c)
-        R_inv = R.T
-        t_inv = -R_inv @ t
-        c2w = np.concatenate([R_inv, t_inv], axis=1)  # (3, 4)
-
-        # Unproject pixels to camera space
-        K_inv = np.linalg.inv(K)
-        d = depth[i]  # (H, W)
-
-        # Camera coordinates
-        cam_coords = (K_inv @ pixels.reshape(-1, 3).T).T.reshape(H, W, 3)
-        cam_coords = cam_coords * d[..., None]  # (H, W, 3)
-
-        # Transform to world coordinates
-        cam_coords_homo = np.concatenate([cam_coords, np.ones((H, W, 1))], axis=-1)  # (H, W, 4)
-        c2w_4x4 = np.eye(4)
-        c2w_4x4[:3, :] = c2w
-        world_coords = (c2w_4x4 @ cam_coords_homo.reshape(-1, 4).T).T.reshape(H, W, 4)
-        world_points.append(world_coords[..., :3])
-
-    return np.stack(world_points, axis=0)  # (N, H, W, 3)
-
-
 def viser_wrapper(
     pred_dict: dict,
     port: int = 8081,
     init_conf_threshold: float = 50.0,
     background_mode: bool = False,
     image_folder: str = None,
+    image_names: List[str] = None,
+    show_image_names: bool = False,
+    feature_layer: int = None,
 ):
     """
     Visualize predicted 3D points and camera poses with viser.
@@ -106,6 +54,8 @@ def viser_wrapper(
         init_conf_threshold (float): Initial percentage of low-confidence points to filter out.
         background_mode (bool): Whether to run the server in background thread.
         image_folder (str): Path to the folder containing input images.
+        image_names (List[str]): List of image names for display.
+        show_image_names (bool): Whether to show image names as labels.
     """
     print(f"Starting viser server on port {port}")
 
@@ -113,18 +63,36 @@ def viser_wrapper(
     server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
 
     # Unpack prediction dict
-    images = pred_dict["processed_images"]  # (N, H, W, 3) uint8
+    if feature_layer is not None:
+        from jhutil import color_log; color_log(1111, pred_dict)
+        images = pred_dict["feat_hr"]
+        images = (images - images.min()) / (images.max() - images.min())
+    else:
+        images = pred_dict["processed_images"]  # (N, H, W, 3) uint8
     depth_map = pred_dict["depth"]  # (N, H, W)
     conf = pred_dict["conf"]  # (N, H, W)
     extrinsics_cam = pred_dict["extrinsics"]  # (N, 3, 4)
     intrinsics_cam = pred_dict["intrinsics"]  # (N, 3, 3)
+    world_points = pred_dict["world_points"]  # (N, H, W, 3)
 
-    # Compute world points from depth
-    world_points = unproject_depth_to_points(depth_map, extrinsics_cam, intrinsics_cam)
+    # Get image names for display
+    N = images.shape[0]
+    if image_names is not None:
+        display_names = [os.path.basename(name) for name in image_names]
+    elif "image_names" in pred_dict:
+        display_names = [os.path.basename(name) for name in pred_dict["image_names"]]
+    elif image_folder is not None:
+        exts = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
+        all_files = sorted([f for f in os.listdir(image_folder)
+                           if os.path.splitext(f)[1].lower() in exts])[:N]
+        display_names = all_files if len(all_files) == N else [f"image_{i:03d}" for i in range(N)]
+    else:
+        display_names = [f"image_{i:03d}" for i in range(N)]
+
 
     # Convert images from uint8 to float [0, 1] for colors
-    colors = images.astype(np.float32) / 255.0  # (N, H, W, 3)
-    N, H, W, _ = world_points.shape
+    colors = images.astype(np.float32)
+    _, H, W, _ = world_points.shape
 
     # Flatten
     points = world_points.reshape(-1, 3)
@@ -159,7 +127,9 @@ def viser_wrapper(
     )
 
     gui_frame_selector = server.gui.add_dropdown(
-        "Show Points from Frames", options=["All"] + [str(i) for i in range(N)], initial_value="All"
+        "Show Points from Frames",
+        options=["All"] + [f"{i}: {display_names[i]}" for i in range(N)],
+        initial_value="All"
     )
 
     # Create the main point cloud handle
@@ -173,9 +143,10 @@ def viser_wrapper(
         point_shape="circle",
     )
 
-    # Store references to frames & frustums
+    # Store references to frames & frustums & labels
     frames: List[viser.FrameHandle] = []
     frustums: List[viser.CameraFrustumHandle] = []
+    labels: List[viser.LabelHandle] = []
 
     def visualize_frames(extrinsics: np.ndarray, images_: np.ndarray) -> None:
         """Add camera frames and frustums to the scene."""
@@ -185,6 +156,9 @@ def viser_wrapper(
         for fr in frustums:
             fr.remove()
         frustums.clear()
+        for lbl in labels:
+            lbl.remove()
+        labels.clear()
 
         def attach_callback(frustum: viser.CameraFrustumHandle, frame: viser.FrameHandle) -> None:
             @frustum.on_click
@@ -210,14 +184,25 @@ def viser_wrapper(
             img = images_[img_id]  # (H, W, 3) uint8
             h, w = img.shape[:2]
 
-            fy = 1.1 * h
-            fov = 2 * np.arctan2(h / 2, fy)
+            # Use actual intrinsics for FOV calculation
+            fy = intrinsics_cam[img_id, 1, 1]
+            cy = intrinsics_cam[img_id, 1, 2]
+            # FOV based on actual focal length and principal point
+            fov = 2 * np.arctan2(cy, fy)
 
             frustum_cam = server.scene.add_camera_frustum(
                 f"frame_{img_id}/frustum", fov=fov, aspect=w / h, scale=0.05, image=img, line_width=1.0
             )
             frustums.append(frustum_cam)
             attach_callback(frustum_cam, frame_axis)
+
+            # Add label with image name in front of the camera
+            if show_image_names:
+                label = server.scene.add_label(
+                    f"frame_{img_id}/label",
+                    text=f"{1111 * (img_id + 1)} {display_names[img_id]}",
+                )
+                labels.append(label)
 
     def update_point_cloud() -> None:
         """Update the point cloud based on current GUI selections."""
@@ -231,7 +216,8 @@ def viser_wrapper(
         if gui_frame_selector.value == "All":
             frame_mask = np.ones_like(conf_mask, dtype=bool)
         else:
-            selected_idx = int(gui_frame_selector.value)
+            # Parse "0: image_name" format
+            selected_idx = int(gui_frame_selector.value.split(":")[0])
             frame_mask = frame_indices == selected_idx
 
         combined_mask = conf_mask & frame_mask
@@ -252,6 +238,8 @@ def viser_wrapper(
             f.visible = gui_show_frames.value
         for fr in frustums:
             fr.visible = gui_show_frames.value
+        for lbl in labels:
+            lbl.visible = gui_show_frames.value
 
     # Add the camera frames to the scene
     visualize_frames(cam_to_world, images)
@@ -286,6 +274,8 @@ parser.add_argument("--n_images", type=int, default=-1, help="Number of images t
 parser.add_argument("--process_res", type=int, default=504, help="Processing resolution")
 parser.add_argument("--visualize_cache_file", type=str, default=None, help="Path to cached predictions")
 parser.add_argument("--skip_visualization", action="store_true", help="Skip visualization and only save predictions")
+parser.add_argument("--show_image_names", action="store_true", help="Show image names as labels above cameras")
+parser.add_argument("--feat_layer", type=int, default=None)
 
 
 def main():
@@ -296,7 +286,7 @@ def main():
 
     # Validate arguments
     if args.visualize_cache_file is None:
-        if args.colmap_dir is None and args.image_folder is None:
+        if args.colmap_dir is None and args.image_folder is None and args.image_names is None:
             parser.error("Either --colmap_dir or --image_folder is required")
 
     if args.visualize_cache_file:
@@ -309,7 +299,10 @@ def main():
             colmap_dir=args.colmap_dir,
             n_images=args.n_images,
             process_res=args.process_res,
+            feat_layer=args.feat_layer,
+            upsample=args.feat_layer is not None,
         )
+        from jhutil import color_log; color_log(2222, predictions)
 
     if not args.skip_visualization:
         print("Processing model outputs...")
@@ -326,6 +319,9 @@ def main():
             init_conf_threshold=args.conf_threshold,
             background_mode=args.background_mode,
             image_folder=args.image_folder,
+            image_names=args.image_names,
+            show_image_names=args.show_image_names,
+            feature_layer=args.feat_layer
         )
         print("Visualization complete")
 
