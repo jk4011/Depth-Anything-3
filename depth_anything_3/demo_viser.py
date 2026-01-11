@@ -82,7 +82,7 @@ def viser_wrapper(
     elif "image_names" in pred_dict:
         display_names = [os.path.basename(name) for name in pred_dict["image_names"]]
     elif image_folder is not None:
-        exts = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
+        exts = ['.jpg', '.JPG', '.jpeg', '.JPEG', '.png', '.PNG', '.bmp', '.webp']
         all_files = sorted([f for f in os.listdir(image_folder)
                            if os.path.splitext(f)[1].lower() in exts])[:N]
         display_names = all_files if len(all_files) == N else [f"image_{i:03d}" for i in range(N)]

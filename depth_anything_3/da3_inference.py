@@ -52,7 +52,7 @@ def load_model(model_name):
 
     """Load Depth Anything 3 model. If model is already loaded, return it."""
     global model
-    if model is None or model.model_name != model_name:
+    if model is None or model_name not in model.model_name:
         print(f"Loading Depth Anything 3 ({model_name})...")
         model = DepthAnything3.from_pretrained(model_path[model_name])
         model = model.to(device=torch.device(device))
@@ -246,6 +246,11 @@ def _da3_inference(
     print(f"Running DA3 inference ({mode}) on {len(image_names)} images...")
 
     # Run inference
+    from jhutil import color_log; color_log(1111, image_names)
+    from jhutil import color_log; color_log(2222, extrinsics)
+    from jhutil import color_log; color_log(3333, intrinsics)
+    from jhutil import color_log; color_log(4444, process_res)
+    from jhutil import color_log; color_log(5555, process_res_method)
     prediction = model.inference(
         image_names,
         extrinsics=extrinsics,
@@ -257,11 +262,11 @@ def _da3_inference(
 
     # Prepare output dictionary
     predictions = {
-        'depth': prediction.depth,  # (N, H, W)
-        'conf': prediction.conf,  # (N, H, W)
-        'extrinsics': prediction.extrinsics,  # (N, 3, 4)
-        'intrinsics': prediction.intrinsics,  # (N, 3, 3)
-        'processed_images': prediction.processed_images / 255.0,  # (N, H, W, 3)
+        'depth': torch.tensor(prediction.depth),  # (N, H, W)
+        'conf': torch.tensor(prediction.conf),  # (N, H, W)
+        'extrinsics': torch.tensor(prediction.extrinsics),  # (N, 3, 4)
+        'intrinsics': torch.tensor(prediction.intrinsics),  # (N, 3, 3)
+        'processed_images': torch.tensor(prediction.processed_images).permute(0, 3, 1, 2) / 255.0,  # (N, H, W, 3)
     }
 
     # Add optional fields if available
@@ -271,7 +276,7 @@ def _da3_inference(
     # Extract features from aux if feat_layer was requested
     if feat_layer is not None:
         key = f"feat_layer_{feat_layer}"
-        predictions['feat'] = prediction.aux[key]
+        predictions['feat'] = torch.tensor(prediction.aux[key])
 
     print("Inference completed")
     return EasyDict(predictions)
@@ -295,7 +300,7 @@ def upsample_features(processed_images, feat, pca_dim=3, pca_subsamples=10000):
     load_upsampler()
 
     N = processed_images.shape[0]
-    H, W = processed_images.shape[1], processed_images.shape[2]
+    H, W = processed_images.shape[2], processed_images.shape[3]
 
     # ImageNet normalization constants
     mean_img = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -313,14 +318,14 @@ def upsample_features(processed_images, feat, pca_dim=3, pca_subsamples=10000):
     hr_features_list = []
     for i in range(N):
         # Prepare single image: (1, 3, H, W), already in [0, 1]
-        hr_img = torch.from_numpy(processed_images[i:i+1]).permute(0, 3, 1, 2).float().to(device)
+        hr_img = processed_images[i:i+1].float().to(device)
         hr_img = (hr_img - mean_img) / std_img
 
         # Get single feature map: (1, h, w, C) -> (1, C, h, w) for AnyUp
         lr_feat = feat[i:i+1].permute(0, 3, 1, 2).to(device)
 
         # Upsample: output is (1, C, H, W)
-        hr_feat = upsampler(hr_img, lr_feat, q_chunk_size=256)
+        hr_feat = upsampler(hr_img, lr_feat, q_chunk_size=256).to(torch.float32)
 
         # Convert back to (1, H, W, C)
         hr_feat = hr_feat.permute(0, 2, 3, 1).cpu()
@@ -347,8 +352,8 @@ def upsample_features(processed_images, feat, pca_dim=3, pca_subsamples=10000):
     feat_centered = feat_subsample - mean_feat
 
     # Compute PCA via SVD
-    U, S, Vh = torch.linalg.svd(feat_centered, full_matrices=False)
-    components = Vh[:pca_dim]  # (pca_dim, C)
+    U, S, Vh = torch.linalg.svd(feat_centered.cuda(), full_matrices=False)
+    components = Vh[:pca_dim].cpu()  # (pca_dim, C)
 
     # Apply PCA to all features
     feat_flat_centered = feat_flat - mean_feat
@@ -366,6 +371,14 @@ def unproject_depth_to_points(
     extrinsics: np.ndarray,
     intrinsics: np.ndarray,
 ) -> np.ndarray:
+
+    # TODO: change this logic from numpy to torch
+    if isinstance(depth, torch.Tensor):
+        depth = depth.cpu().numpy()
+    if isinstance(extrinsics, torch.Tensor):
+        extrinsics = extrinsics.cpu().numpy()
+    if isinstance(intrinsics, torch.Tensor):
+        intrinsics = intrinsics.cpu().numpy()
     """
     Unproject depth maps to 3D world points.
 
@@ -431,7 +444,8 @@ def da3_inference(
     pca_subsamples: int = 10000,
     model_name: str = "giant",
 ) -> EasyDict:
-    image_names = [str(image_name) for image_name in image_names]
+    if image_names is not None:
+        image_names = [str(image_name) for image_name in image_names]
     print("da3_viser \\\n" + \
         (f"--image_folder  {image_folder} \\\n"          if image_folder is not None else "") + \
         (f"--image_names   {' '.join(image_names)} \\\n" if image_names is not None else "") + \
@@ -529,7 +543,7 @@ def da3_inference(
             pca_dim=pca_dim,
             pca_subsamples=pca_subsamples,
         )
-
+    
     return prediction
 
 
