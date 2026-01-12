@@ -90,13 +90,12 @@ def viser_wrapper(
         display_names = [f"image_{i:03d}" for i in range(N)]
 
 
-    # Convert images from uint8 to float [0, 1] for colors
-    colors = images.astype(np.float32)
+    # Prepare colors for point cloud
     _, H, W, _ = world_points.shape
 
     # Flatten
     points = world_points.reshape(-1, 3)
-    colors_flat = (colors.reshape(-1, 3) * 255).astype(np.uint8)
+    colors_flat = images.reshape(-1, 3).astype(np.uint8)
     conf_flat = conf.reshape(-1)
 
     # Compute camera-to-world transforms
