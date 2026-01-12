@@ -232,6 +232,7 @@ def _da3_inference(
     process_res_method: str = "upper_bound_resize",
     feat_layer: int = None,
     model_name: str = "giant",
+    infer_gs: bool = False,
 ) -> dict:
     """
     Cached Depth Anything 3 inference function.
@@ -244,6 +245,7 @@ def _da3_inference(
         process_res_method: Resize method for processing
         export_feat_layers: List of layer indices to export features from
         upsample: If True, upsample low-res features to high-res using AnyUp
+        infer_gs: If True, infer Gaussian parameters
 
     Returns:
         Dictionary containing:
@@ -254,6 +256,7 @@ def _da3_inference(
             - processed_images: Processed input images (N, H, W, 3)
             - feat: (if export_feat_layers) Dict of features per layer
             - feat_hr: (if upsample) Dict of upsampled features per layer
+            - gs: (if infer_gs) Gaussian parameters
     """
     load_model(model_name)
 
@@ -267,6 +270,7 @@ def _da3_inference(
         process_res=process_res,
         process_res_method=process_res_method,
         export_feat_layers=None if feat_layer is None else [feat_layer],
+        infer_gs=infer_gs,
     )
 
     # Prepare output dictionary
@@ -452,6 +456,7 @@ def da3_inference(
     pca_dim: int = 3,
     pca_subsamples: int = 10000,
     model_name: str = "giant",
+    infer_gs: bool = False,
 ) -> EasyDict:
     if image_names is not None:
         image_names = [str(image_name) for image_name in image_names]
@@ -462,7 +467,7 @@ def da3_inference(
         (f"--colmap_dir    {colmap_dir} \\\n"            if colmap_dir is not None else "") + \
         (f"--n_images      {n_images} \\\n"              if n_images != -1 else "") + \
         (f"--process_res   {process_res} \\\n"           if process_res != 504 else "") + \
-        (f"--feat_layer    {feat_layer} \\\n"            if feat_layer is not None else "")
+        (f"--feat_layer    {feat_layer} \\\n"            if feat_layer is not None and not upsample else "")
     )
     """
     Run Depth Anything 3 inference on images.
@@ -481,6 +486,7 @@ def da3_inference(
         upsample: If True, upsample low-res features to high-res using AnyUp
         pca_dim: Target dimension after PCA (None to skip PCA)
         pca_subsamples: Number of samples for fitting PCA
+        infer_gs: If True, infer Gaussian parameters
 
     Returns:
         EasyDict containing inference results
@@ -536,6 +542,7 @@ def da3_inference(
         process_res_method=process_res_method,
         feat_layer=feat_layer,
         model_name=model_name,
+        infer_gs=infer_gs,
     )
 
     # get points
@@ -574,6 +581,8 @@ if __name__ == "__main__":
                         help="Layer index to export features from (e.g., --feat_layer 20)")
     parser.add_argument("--upsample", action='store_true',
                         help="Upsample features using AnyUp")
+    parser.add_argument("--infer_gs", action='store_true',
+                        help="Infer Gaussian parameters")
     parser.add_argument("--device", type=str, default='cuda',
                         help="Device to run inference on")
 
@@ -595,6 +604,7 @@ if __name__ == "__main__":
         process_res=args.process_res,
         feat_layer=args.feat_layer,
         upsample=args.upsample,
+        infer_gs=args.infer_gs,
     )
 
     print("Done!")
@@ -605,3 +615,5 @@ if __name__ == "__main__":
         print(f"Features (layer {args.feat_layer}): {predictions['feat'].shape}")
     if 'feat_hr' in predictions:
         print(f"Features HR (layer {args.feat_layer}): {predictions['feat_hr'].shape}")
+    if 'gs' in predictions:
+        print(f"Gaussian parameters: {predictions['gs']}")
