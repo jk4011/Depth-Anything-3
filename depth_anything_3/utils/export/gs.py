@@ -22,6 +22,7 @@ from depth_anything_3.specs import Prediction
 from depth_anything_3.utils.gsply_helpers import save_gaussian_ply
 from depth_anything_3.utils.layout_helpers import hcat, vcat
 from depth_anything_3.utils.visualize import vis_depth_map_tensor
+import numpy as np
 
 VIDEO_QUALITY_MAP = {
     "low": {"crf": "28", "preset": "veryfast"},
@@ -60,7 +61,7 @@ def export_to_gs_ply(
 
 def export_to_gs_video(
     prediction: Prediction,
-    export_dir: str,
+    export_dir: str = "/root/data1/jinhyeok/seg123/gs_video",
     extrinsics: Optional[torch.Tensor] = None,  # render views' world2cam, "b v 4 4"
     intrinsics: Optional[torch.Tensor] = None,  # render views' unnormed intrinsics, "b v 3 3"
     out_image_hw: Optional[tuple[int, int]] = None,  # render views' resolution, (h, w)
@@ -86,16 +87,23 @@ def export_to_gs_video(
     if extrinsics is not None:
         tgt_extrs = extrinsics
     else:
-        tgt_extrs = torch.from_numpy(prediction.extrinsics).unsqueeze(0).to(gs_world.means)
-        if prediction.is_metric:
+        if isinstance(prediction.extrinsics, np.ndarray):
+            extrinsics = torch.from_numpy(prediction.extrinsics)
+        else:
+            extrinsics = prediction.extrinsics
+        tgt_extrs = extrinsics.unsqueeze(0).to(gs_world.means)
+        if hasattr(prediction, "is_metric") and prediction.is_metric:
             scale_factor = prediction.scale_factor
             if scale_factor is not None:
                 tgt_extrs[:, :, :3, 3] /= scale_factor
-    tgt_intrs = (
-        intrinsics
-        if intrinsics is not None
-        else torch.from_numpy(prediction.intrinsics).unsqueeze(0).to(gs_world.means)
-    )
+    if intrinsics is not None:
+        tgt_intrs = intrinsics
+    else:
+        if isinstance(prediction.intrinsics, np.ndarray):
+            intrinsics = torch.from_numpy(prediction.intrinsics)
+        else:
+            intrinsics = prediction.intrinsics
+        tgt_intrs = intrinsics.unsqueeze(0).to(gs_world.means)
     # if render resolution is not provided, render the input ones
     if out_image_hw is not None:
         H, W = out_image_hw
@@ -152,3 +160,20 @@ def export_to_gs_video(
             ffmpeg_params=ffmpeg_params,
         )
     return
+
+
+def remove_floating_gaussians(result, depth_threshold=0.03):
+    depth = result.depth
+    depth_x_shifted = torch.cat([depth[:, 1:], depth[:, :1]], dim=1)
+    depth_y_shifted = torch.cat([depth[:, 2:], depth[:, :2]], dim=1)
+
+    divider_x = torch.min(torch.stack([depth, depth_x_shifted], dim=0), dim=0)[0]
+    depth_dist_x = (depth - depth_x_shifted).abs() / divider_x
+
+    divider_y = torch.min(torch.stack([depth, depth_y_shifted], dim=0), dim=0)[0]
+    depth_dist_y = (depth - depth_y_shifted).abs() / divider_y
+
+    filter_out_mask = ((depth_dist_x > depth_threshold) & (depth_dist_y > depth_threshold))
+    result.gaussians.opacities[0, filter_out_mask.ravel()] = 0.
+
+    return result

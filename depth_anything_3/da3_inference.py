@@ -222,6 +222,30 @@ def load_colmap_poses(
         return np.array(extrinsics), np.array(intrinsics), ordered_names
 
 
+@cache_output(func_name="da3_inference_simple", override=False)
+def da3_inference_simple(
+    image_names: list = None,
+    extrinsics: np.ndarray = None,
+    intrinsics: np.ndarray = None,
+    process_res: int = 504,
+    process_res_method: str = "upper_bound_resize",
+    feat_layer: int = None,
+    model_name: str = "giant",
+    infer_gs: bool = True,
+) -> dict:
+    load_model(model_name)
+
+    return _state.model.inference(
+        image_names,
+        extrinsics=extrinsics,
+        intrinsics=intrinsics,
+        process_res=process_res,
+        process_res_method=process_res_method,
+        export_feat_layers=None if feat_layer is None else [feat_layer],
+        infer_gs=infer_gs,
+    )
+
+
 @cache_output(func_name="_da3_inference", override=False)
 @torch.inference_mode()
 def _da3_inference(
@@ -256,7 +280,7 @@ def _da3_inference(
             - processed_images: Processed input images (N, H, W, 3)
             - feat: (if export_feat_layers) Dict of features per layer
             - feat_hr: (if upsample) Dict of upsampled features per layer
-            - gs: (if infer_gs) Gaussian parameters
+            - gaussians: (if infer_gs) Gaussian parameters
     """
     load_model(model_name)
 
@@ -283,8 +307,8 @@ def _da3_inference(
     }
 
     # Add optional fields if available
-    if hasattr(prediction, 'gaussians') and prediction.gaussians is not None:
-        predictions['gs'] = prediction.gaussians
+    if hasattr(prediction, 'gaussians'):
+        predictions['gaussians'] = prediction.gaussians
 
     # Extract features from aux if feat_layer was requested
     if feat_layer is not None:
@@ -392,6 +416,8 @@ def unproject_depth_to_points(
         extrinsics = extrinsics.cpu().numpy()
     if isinstance(intrinsics, torch.Tensor):
         intrinsics = intrinsics.cpu().numpy()
+    if extrinsics.shape[1] == 4:
+        extrinsics = extrinsics[:, :3, :]
     """
     Unproject depth maps to 3D world points.
 
@@ -460,6 +486,9 @@ def da3_inference(
 ) -> EasyDict:
     if image_names is not None:
         image_names = [str(image_name) for image_name in image_names]
+    
+    if upsample:
+        assert feat_layer is not None, "feat_layer must be provided if upsample is True"
     print("da3_viser \\\n" + \
         (f"--image_folder  {image_folder} \\\n"          if image_folder is not None else "") + \
         (f"--image_names   {' '.join(image_names)} \\\n" if image_names is not None else "") + \
@@ -467,7 +496,7 @@ def da3_inference(
         (f"--colmap_dir    {colmap_dir} \\\n"            if colmap_dir is not None else "") + \
         (f"--n_images      {n_images} \\\n"              if n_images != -1 else "") + \
         (f"--process_res   {process_res} \\\n"           if process_res != 504 else "") + \
-        (f"--feat_layer    {feat_layer} \\\n"            if feat_layer is not None and not upsample else "")
+        (f"--feat_layer    {feat_layer} \\\n"            if feat_layer is not None else "")
     )
     """
     Run Depth Anything 3 inference on images.
@@ -581,8 +610,6 @@ if __name__ == "__main__":
                         help="Layer index to export features from (e.g., --feat_layer 20)")
     parser.add_argument("--upsample", action='store_true',
                         help="Upsample features using AnyUp")
-    parser.add_argument("--infer_gs", action='store_true',
-                        help="Infer Gaussian parameters")
     parser.add_argument("--device", type=str, default='cuda',
                         help="Device to run inference on")
 
@@ -604,7 +631,6 @@ if __name__ == "__main__":
         process_res=args.process_res,
         feat_layer=args.feat_layer,
         upsample=args.upsample,
-        infer_gs=args.infer_gs,
     )
 
     print("Done!")
@@ -615,5 +641,3 @@ if __name__ == "__main__":
         print(f"Features (layer {args.feat_layer}): {predictions['feat'].shape}")
     if 'feat_hr' in predictions:
         print(f"Features HR (layer {args.feat_layer}): {predictions['feat_hr'].shape}")
-    if 'gs' in predictions:
-        print(f"Gaussian parameters: {predictions['gs']}")

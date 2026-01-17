@@ -33,27 +33,10 @@ from pathlib import Path
 # Add gsplat examples to path for gsplat_viewer
 sys.path.insert(0, str(Path("/root/data1/jinhyeok/gsplat/examples")))
 
-# Import gsplat rendering
-try:
-    from gsplat.rendering import rasterization
-except ImportError:
-    raise ImportError(
-        "gsplat is required for Gaussian rendering. "
-        "Install via: pip install git+https://github.com/nerfstudio-project/gsplat.git"
-    )
-
-# Import viser and viewer
-try:
-    import viser
-    from nerfview import CameraState, RenderTabState, apply_float_colormap
-    from gsplat_viewer import GsplatViewer, GsplatRenderTabState
-except ImportError as e:
-    raise ImportError(
-        f"Viewer dependencies are required: {e}\n"
-        "Install via: cd /root/data1/jinhyeok/gsplat/examples && pip install -r requirements.txt"
-    )
-
-# Import DA3
+from gsplat.rendering import rasterization
+import viser
+from nerfview import CameraState, RenderTabState, apply_float_colormap
+from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from depth_anything_3.da3_inference import da3_inference
 
 
@@ -115,7 +98,7 @@ def main():
     )
 
     # Check if Gaussians were predicted
-    if not hasattr(predictions, 'gs') or predictions.gs is None:
+    if not hasattr(predictions, 'gaussians') or predictions.gaussians is None:
         raise RuntimeError(
             "Gaussian parameters were not predicted. "
             "Make sure the model supports Gaussian inference."
@@ -128,7 +111,7 @@ def main():
     print("Step 2: Preparing Gaussians for visualization")
     print("=" * 80)
 
-    gaussians = predictions.gs
+    gaussians = predictions.gaussians
 
     # Extract Gaussian parameters (all should be in world space)
     # DA3 provides: means, scales, rotations (wxyz), opacities, harmonics (SH)

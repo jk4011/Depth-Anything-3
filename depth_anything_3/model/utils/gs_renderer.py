@@ -50,21 +50,23 @@ def render_3dgs(
     use_sh: bool = True,
     num_view: int = 1,
     color_mode: Literal["RGB+D", "RGB+ED"] = "RGB+D",
+    return_alpha: bool = False,
     **kwargs,
 ) -> tuple[
     torch.Tensor,  # "batch_views 3 height width"
     torch.Tensor,  # "batch_views height width"
 ]:
     # extract gaussian params
-    gaussian_means = gaussian.means
-    gaussian_scales = gaussian.scales
-    gaussian_quats = gaussian.rotations
-    gaussian_opacities = gaussian.opacities
-    gaussian_sh_coefficients = gaussian.harmonics
+    gaussian_means = gaussian.means.cuda()
+    gaussian_scales = gaussian.scales.cuda()
+    gaussian_quats = gaussian.rotations.cuda()
+    gaussian_opacities = gaussian.opacities.cuda()
+    gaussian_sh_coefficients = gaussian.harmonics.cuda()
     b, _, _ = extrinsics.shape
 
     if background_color is None:
-        background_color = repeat(torch.tensor([0.0, 0.0, 0.0]), "c -> b c", b=b).to(
+        # white background
+        background_color = repeat(torch.tensor([1.0, 1.0, 1.0]), "c -> b c", b=b).to(
             gaussian_sh_coefficients
         )
 
@@ -90,6 +92,7 @@ def render_3dgs(
     all_images = []
     all_radii = []
     all_depths = []
+    all_alphas = []
     # render view in a batch based, each batch contains one scene
     # assume the Gaussian parameters are originally repeated along the view dim
     batch_scene = b // num_view
@@ -141,16 +144,22 @@ def render_3dgs(
         depth = render_colors[..., -1].unbind(dim=0)
 
         image = rearrange(render_colors[..., :3], "v h w c -> v c h w").unbind(dim=0)
+        alpha = render_alphas[..., 0].unbind(dim=0)
         radii = info["radii"].unbind(dim=0)
         try:
             info["means2d"].retain_grad()  # [1, N, 2]
         except Exception:
             pass
+            
         all_images.extend(image)
         all_depths.extend(depth)
+        all_alphas.extend(alpha)
         all_radii.extend(radii)
 
-    return torch.stack(all_images), torch.stack(all_depths)
+    if return_alpha:
+        return torch.stack(all_images), torch.stack(all_depths), torch.stack(all_alphas)
+    else:
+        return torch.stack(all_images), torch.stack(all_depths)
 
 
 def run_renderer_in_chunk_w_trj_mode(
