@@ -39,6 +39,7 @@ dependencies = [
     "moviepy==1.0.3",
     "typer>=0.9.0",
     "pycolmap",
+    "torch==2.4.1+cu124",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +51,7 @@ all = ["depth-anything-3[app,gs]"]
 [project.scripts]
 da3 = "depth_anything_3.cli:app"
 da3_viser = "depth_anything_3.demo_viser:main"
+da3_gsplat = "depth_anything_3.demo_gsplat:main"
 
 [project.urls]
 Homepage = "https://github.com/ByteDance-Seed/Depth-Anything-3"

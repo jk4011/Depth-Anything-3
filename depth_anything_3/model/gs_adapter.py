@@ -72,19 +72,20 @@ class GaussianAdapter(nn.Module):
         H, W = image_shape
         b, v = raw_gaussians.shape[:2]
 
+
+        # 1. compute 3DGS means
+        # 1.1) offset the predicted depth if needed
+        if self.pred_offset_depth:
+            gs_depths = depths # + raw_gaussians[..., -1]
+            raw_gaussians = raw_gaussians[..., :-1]
+        else:
+            gs_depths = depths
+
         # get cam2worlds and intr_normed to adapt to 3DGS codebase
         cam2worlds = affine_inverse(extrinsics)
         intr_normed = intrinsics.clone().detach()
         intr_normed[..., 0, :] /= W
         intr_normed[..., 1, :] /= H
-
-        # 1. compute 3DGS means
-        # 1.1) offset the predicted depth if needed
-        if self.pred_offset_depth:
-            gs_depths = depths + raw_gaussians[..., -1]
-            raw_gaussians = raw_gaussians[..., :-1]
-        else:
-            gs_depths = depths
         # 1.2) align predicted poses with GT if needed
         if gt_extrinsics is not None and not torch.equal(extrinsics, gt_extrinsics):
             try:
@@ -106,16 +107,29 @@ class GaussianAdapter(nn.Module):
         if self.pred_offset_xy:
             pixel_size = 1 / torch.tensor((W, H), dtype=xy_ray.dtype, device=device)
             offset_xy = raw_gaussians[..., :2]
-            xy_ray = xy_ray + offset_xy * pixel_size
+            xy_ray = xy_ray # + offset_xy * pixel_size
             raw_gaussians = raw_gaussians[..., 2:]  # skip the offset_xy
-        # 1.4) unproject depth + xy to world ray
-        origins, directions = get_world_rays(
-            xy_ray,
-            repeat(cam2worlds, "b v i j -> b v h w i j", h=H, w=W),
-            repeat(intr_normed, "b v i j -> b v h w i j", h=H, w=W),
-        )
-        gs_means_world = origins + directions * gs_depths[..., None]
-        gs_means_world = rearrange(gs_means_world, "b v h w d -> b (v h w) d")
+        
+        if False:
+            # 1.4) unproject depth + xy to world ray
+            origins, directions = get_world_rays(
+                xy_ray,
+                repeat(cam2worlds, "b v i j -> b v h w i j", h=H, w=W),
+                repeat(intr_normed, "b v i j -> b v h w i j", h=H, w=W),
+            )
+            gs_means_world = origins + directions * gs_depths[..., None]
+            gs_means_world = rearrange(gs_means_world, "b v h w d -> b (v h w) d")
+
+        if True:
+            from depth_anything_3.da3_inference import unproject_depth_to_points
+            gs_means_world = unproject_depth_to_points(
+                depth=gs_depths[0],
+                extrinsics=extrinsics[0],
+                intrinsics=intrinsics[0],
+            )[None]
+            gs_means_world = rearrange(gs_means_world, "b v h w d -> b (v h w) d")
+            gs_means_world = torch.tensor(gs_means_world, device=device, dtype=dtype)
+
 
         # 2. compute other GS attributes
         scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
@@ -125,6 +139,7 @@ class GaussianAdapter(nn.Module):
         scale_min = self.gaussian_scale_min
         scale_max = self.gaussian_scale_max
         scales = scale_min + (scale_max - scale_min) * scales.sigmoid()
+        scales = torch.ones_like(scales, device=device, dtype=dtype)
         pixel_size = 1 / torch.tensor((W, H), dtype=dtype, device=device)
         multiplier = self.get_scale_multiplier(intr_normed, pixel_size)
         gs_scales = scales * gs_depths[..., None] * multiplier[..., None, None, None]
@@ -159,13 +174,14 @@ class GaussianAdapter(nn.Module):
 
         # 2.4) 3DGS opacity
         gs_opacities = rearrange(opacities, "b v h w ... -> b (v h w) ...")
+        gs_opacities[gs_opacities > 0.01] = 1
 
         return Gaussians(
-            means=gs_means_world,
-            harmonics=gs_sh_world,
-            opacities=gs_opacities,
-            scales=gs_scales,
-            rotations=gs_rotations_world,
+            means=gs_means_world.cpu(),
+            harmonics=gs_sh_world.cpu(),
+            opacities=gs_opacities.cpu(),
+            scales=gs_scales.cpu(),
+            rotations=gs_rotations_world.cpu(),
         )
 
     def get_scale_multiplier(
