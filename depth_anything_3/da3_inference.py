@@ -28,6 +28,8 @@ from depth_anything_3.utils.read_write_model import (
 )
 from jhutil import cache_output
 from easydict import EasyDict
+from depth_anything_3.specs import Gaussians
+
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -297,13 +299,14 @@ def _da3_inference(
         infer_gs=infer_gs,
     )
 
-    # Prepare output dictionary
+    # Prepare output dictionary — all tensors on CUDA
+    _dev = device
     predictions = {
-        'depth': torch.tensor(prediction.depth),  # (N, H, W)
-        'conf': torch.tensor(prediction.conf),  # (N, H, W)
-        'extrinsics': torch.tensor(prediction.extrinsics),  # (N, 3, 4)
-        'intrinsics': torch.tensor(prediction.intrinsics),  # (N, 3, 3)
-        'processed_images': torch.tensor(prediction.processed_images).permute(0, 3, 1, 2) / 255.0,  # (N, H, W, 3)
+        'depth': torch.as_tensor(prediction.depth, dtype=torch.float32, device=_dev),
+        'conf': torch.as_tensor(prediction.conf, dtype=torch.float32, device=_dev),
+        'extrinsics': torch.as_tensor(prediction.extrinsics, dtype=torch.float32, device=_dev),
+        'intrinsics': torch.as_tensor(prediction.intrinsics, dtype=torch.float32, device=_dev),
+        'processed_images': torch.as_tensor(prediction.processed_images, dtype=torch.float32, device=_dev).permute(0, 3, 1, 2) / 255.0,
     }
 
     # Add optional fields if available
@@ -313,7 +316,7 @@ def _da3_inference(
     # Extract features from aux if feat_layer was requested
     if feat_layer is not None:
         key = f"feat_layer_{feat_layer}"
-        predictions['feat'] = torch.tensor(prediction.aux[key])
+        predictions['feat'] = torch.as_tensor(prediction.aux[key], dtype=torch.float32, device=_dev)
 
     print("Inference completed")
     return EasyDict(predictions)
@@ -323,56 +326,31 @@ def _da3_inference(
 @torch.inference_mode()
 def upsample_features(processed_images, feat, pca_dim=3, pca_subsamples=10000):
     """
-    Upsample low-res features to high-res using AnyUp, then apply PCA.
+    Apply PCA on low-res features first, then upsample to high-res using AnyUp.
 
     Args:
-        processed_images: (N, H, W, 3) in [0, 1]
+        processed_images: (N, 3, H, W) in [0, 1]
         feat: (N, h, w, C) low-res features
         pca_dim: Target dimension after PCA
         pca_subsamples: Number of samples for fitting PCA
 
     Returns:
-        feat_hr: (N, H, W, pca_dim) upsampled and PCA-reduced features
+        feat_hr: (N, H, W, pca_dim) PCA-reduced and upsampled features
     """
     load_upsampler()
 
     N = processed_images.shape[0]
     H, W = processed_images.shape[2], processed_images.shape[3]
 
-    # ImageNet normalization constants
-    mean_img = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std_img = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-
-    print(f"Upsampling features with AnyUp ({N} images)...")
-
     # Convert feat to tensor if numpy
     if isinstance(feat, np.ndarray):
         feat = torch.from_numpy(feat)
 
+    h, w = feat.shape[1], feat.shape[2]
     C = feat.shape[-1]  # feature channels
 
-    # Process one image at a time to avoid 32-bit index overflow
-    hr_features_list = []
-    for i in range(N):
-        # Prepare single image: (1, 3, H, W), already in [0, 1]
-        hr_img = processed_images[i:i+1].float().to(device)
-        hr_img = (hr_img - mean_img) / std_img
-
-        # Get single feature map: (1, h, w, C) -> (1, C, h, w) for AnyUp
-        lr_feat = feat[i:i+1].permute(0, 3, 1, 2).to(device)
-
-        # Upsample: output is (1, C, H, W)
-        hr_feat = _state.upsampler(hr_img, lr_feat, q_chunk_size=256).to(torch.float32)
-
-        # Convert back to (1, H, W, C)
-        hr_feat = hr_feat.permute(0, 2, 3, 1).cpu()
-        hr_features_list.append(hr_feat)
-
-    feat_hr = torch.cat(hr_features_list, dim=0)  # (N, H, W, C)
-    print("Upsampling completed")
-
-    # Apply PCA
-    feat_flat = feat_hr.reshape(-1, C)  # (N*H*W, C)
+    # === Step 1: Apply PCA on low-res features ===
+    feat_flat = feat.reshape(-1, C)  # (N*h*w, C)
     total_pixels = feat_flat.shape[0]
 
     # Subsample for PCA fitting
@@ -382,92 +360,103 @@ def upsample_features(processed_images, feat, pca_dim=3, pca_subsamples=10000):
     else:
         feat_subsample = feat_flat
 
-    print(f"Fitting PCA: {C} -> {pca_dim} dims (using {feat_subsample.shape[0]} samples)...")
+    print(f"Fitting PCA on low-res features: {C} -> {pca_dim} dims (using {feat_subsample.shape[0]} samples)...")
 
     # Center the data
     mean_feat = feat_subsample.mean(dim=0, keepdim=True)
     feat_centered = feat_subsample - mean_feat
 
     # Compute PCA via SVD
-    U, S, Vh = torch.linalg.svd(feat_centered.cuda(), full_matrices=False)
-    components = Vh[:pca_dim].cpu()  # (pca_dim, C)
+    U, S, Vh = torch.linalg.svd(feat_centered.to(feat_flat.device), full_matrices=False)
+    components = Vh[:pca_dim]  # (pca_dim, C)
 
-    # Apply PCA to all features
+    # Apply PCA to all low-res features
     feat_flat_centered = feat_flat - mean_feat
-    feat_pca_flat = feat_flat_centered @ components.T  # (N*H*W, pca_dim)
+    feat_pca_flat = feat_flat_centered @ components.T  # (N*h*w, pca_dim)
 
-    # Reshape back
-    feat_hr = feat_pca_flat.reshape(N, H, W, pca_dim)
+    # Reshape back to low-res spatial dimensions
+    feat_pca = feat_pca_flat.reshape(N, h, w, pca_dim)
+    print(f"PCA completed: (N, {h}, {w}, {C}) -> (N, {h}, {w}, {pca_dim})")
 
-    print(f"PCA completed: (N, H, W, {C}) -> {feat_hr.shape}")
+    # === Step 2: Upsample PCA-reduced features to high-res ===
+    # ImageNet normalization constants
+    mean_img = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std_img = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    print(f"Upsampling PCA features with AnyUp ({N} images, {pca_dim} channels)...")
+
+    # Batched: normalize all images and upsample features at once
+    hr_imgs = processed_images.float().to(device)
+    hr_imgs = (hr_imgs - mean_img) / std_img  # (N, 3, H, W)
+
+    lr_feats = feat_pca.permute(0, 3, 1, 2).to(device)  # (N, pca_dim, h, w)
+
+    hr_feats = _state.upsampler(hr_imgs, lr_feats, q_chunk_size=256).to(torch.float32)  # (N, pca_dim, H, W)
+
+    feat_hr = hr_feats.permute(0, 2, 3, 1).cpu()  # (N, H, W, pca_dim)
+
+    print(f"Upsampling completed: (N, {h}, {w}, {pca_dim}) -> {feat_hr.shape}")
     return feat_hr
 
 
 def unproject_depth_to_points(
-    depth: np.ndarray,
-    extrinsics: np.ndarray,
-    intrinsics: np.ndarray,
-) -> np.ndarray:
-
-    # TODO: change this logic from numpy to torch
-    if isinstance(depth, torch.Tensor):
-        depth = depth.cpu().numpy()
-    if isinstance(extrinsics, torch.Tensor):
-        extrinsics = extrinsics.cpu().numpy()
-    if isinstance(intrinsics, torch.Tensor):
-        intrinsics = intrinsics.cpu().numpy()
-    if extrinsics.shape[1] == 4:
-        extrinsics = extrinsics[:, :3, :]
+    depth,
+    extrinsics,
+    intrinsics,
+) -> torch.Tensor:
     """
-    Unproject depth maps to 3D world points.
+    Unproject depth maps to 3D world points (batched, on GPU).
 
     Args:
         depth: Depth maps (N, H, W)
-        extrinsics: Camera extrinsics w2c (N, 3, 4)
+        extrinsics: Camera extrinsics w2c (N, 3, 4) or (N, 4, 4)
         intrinsics: Camera intrinsics (N, 3, 3)
 
     Returns:
-        World points (N, H, W, 3)
+        World points (N, H, W, 3) as torch.Tensor
     """
+    if isinstance(depth, np.ndarray):
+        depth = torch.from_numpy(depth)
+    if isinstance(extrinsics, np.ndarray):
+        extrinsics = torch.from_numpy(extrinsics)
+    if isinstance(intrinsics, np.ndarray):
+        intrinsics = torch.from_numpy(intrinsics)
+
+    depth = depth.float()
+    extrinsics = extrinsics.float()
+    intrinsics = intrinsics.float()
+
+    if extrinsics.shape[1] == 4:
+        extrinsics = extrinsics[:, :3, :]
+
     N, H, W = depth.shape
 
-    # Create pixel coordinates
-    v, u = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
-    ones = np.ones_like(u)
-    pixels = np.stack([u, v, ones], axis=-1).astype(np.float32)  # (H, W, 3)
+    _dev = depth.device
 
-    world_points = []
-    for i in range(N):
-        # Get camera parameters
-        K = intrinsics[i]  # (3, 3)
-        ext = extrinsics[i]  # (3, 4)
+    # Pixel grid (H, W, 3) — shared across all views, same device
+    v, u = torch.meshgrid(torch.arange(H, dtype=torch.float32, device=_dev), torch.arange(W, dtype=torch.float32, device=_dev), indexing='ij')
+    pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1)  # (H, W, 3)
 
-        # Compute camera-to-world transform
-        R = ext[:3, :3]
-        t = ext[:3, 3:4]
-        # c2w = inv(w2c)
-        R_inv = R.T
-        t_inv = -R_inv @ t
-        c2w = np.concatenate([R_inv, t_inv], axis=1)  # (3, 4)
+    # Batched K_inv: (N, 3, 3)
+    K_inv = torch.linalg.inv(intrinsics)
 
-        # Unproject pixels to camera space
-        K_inv = np.linalg.inv(K)
-        d = depth[i]  # (H, W)
+    # Unproject to camera coords: K_inv @ pixels^T -> (N, 3, H*W)
+    cam_dirs = K_inv @ pixels.reshape(-1, 3).T  # (N, 3, H*W)
+    # Scale by depth: (N, 3, H*W) * (N, 1, H*W)
+    cam_coords = cam_dirs * depth.reshape(N, 1, H * W)  # (N, 3, H*W)
 
-        # Camera coordinates
-        cam_coords = (K_inv @ pixels.reshape(-1, 3).T).T.reshape(H, W, 3)
-        cam_coords = cam_coords * d[..., None]  # (H, W, 3)
+    # c2w from w2c: R_inv = R^T, t_inv = -R^T @ t
+    R = extrinsics[:, :3, :3]  # (N, 3, 3)
+    t = extrinsics[:, :3, 3:]  # (N, 3, 1)
+    R_inv = R.transpose(1, 2)  # (N, 3, 3)
+    t_inv = -R_inv @ t  # (N, 3, 1)
 
-        # Transform to world coordinates
-        cam_coords_homo = np.concatenate([cam_coords, np.ones((H, W, 1))], axis=-1)  # (H, W, 4)
-        c2w_4x4 = np.eye(4)
-        c2w_4x4[:3, :] = c2w
-        world_coords = (c2w_4x4 @ cam_coords_homo.reshape(-1, 4).T).T.reshape(H, W, 4)
-        world_points.append(world_coords[..., :3])
+    # Transform to world: R_inv @ cam_coords + t_inv
+    world_coords = R_inv @ cam_coords + t_inv  # (N, 3, H*W)
 
-    return np.stack(world_points, axis=0)  # (N, H, W, 3)
+    return world_coords.reshape(N, 3, H, W).permute(0, 2, 3, 1)  # (N, H, W, 3)
 
-
+from jhutil import print_time
 
 def da3_inference(
     image_folder: str = None,
@@ -562,17 +551,22 @@ def da3_inference(
         extrinsics, intrinsics, image_names = load_colmap_poses(pose_path, image_names)
         print(f"Loaded {len(image_names)} images with poses")
 
-    # Run inference
-    prediction = _da3_inference(
-        image_names,
-        extrinsics=extrinsics,
-        intrinsics=intrinsics,
-        process_res=process_res,
-        process_res_method=process_res_method,
-        feat_layer=feat_layer,
-        model_name=model_name,
-        infer_gs=infer_gs,
-    )
+    # Run inference (may return CPU tensors from cache)
+    with print_time("da3_inference"):
+        prediction = _da3_inference(
+            image_names,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            process_res=process_res,
+            process_res_method=process_res_method,
+            feat_layer=feat_layer,
+            model_name=model_name,
+        )
+
+    # Move all tensors to CUDA
+    for k, v in prediction.items():
+        if isinstance(v, torch.Tensor) and not v.is_cuda:
+            prediction[k] = v.cuda()
 
     # get points
     prediction.world_points = unproject_depth_to_points(
@@ -581,15 +575,79 @@ def da3_inference(
         prediction.intrinsics,
     )
 
+    # TODO: infer gaussian을 여기서 만들기 
+    if infer_gs:
+        prediction.gaussians = infer_gaussian(prediction)
+
     if hasattr(prediction, 'feat') and prediction.feat is not None and upsample:
-        prediction.feat_hr = upsample_features(
-            prediction.processed_images,
-            prediction.feat,
-            pca_dim=pca_dim,
-            pca_subsamples=pca_subsamples,
-        )
+
+        with print_time("upsample_features"):
+            prediction.feat_hr = upsample_features(
+                prediction.processed_images,
+                prediction.feat,
+                pca_dim=pca_dim,
+                pca_subsamples=pca_subsamples,
+            )
     
     return prediction
+
+C0 = 0.28209479177387814
+
+
+def get_gaussians(
+    depths: torch.Tensor,  # b h w
+    points: torch.Tensor,  # b h w 3
+    images: torch.Tensor,  # b 3 h w
+    conf: torch.Tensor,  # b h w
+    device: torch.device,
+    scale_multiplier: float = 0.01,
+) -> Gaussians:
+    b, h, w = depths.shape
+    N = b * h * w
+
+    # means: (1, N, 3)
+    gs_means = points.reshape(N, 3).unsqueeze(0)
+
+    # harmonics: inline SH0 = (rgb - 0.5) / C0, shape (1, N, 3, 1)
+    gs_harmonics = ((images.permute(0, 2, 3, 1).reshape(N, 3) - 0.5) / C0).unsqueeze(-1).unsqueeze(0)
+
+    # scales: isotropic depth * multiplier, (1, N, 3)
+    gs_scales = (depths.reshape(N, 1) * scale_multiplier).expand(-1, 3).unsqueeze(0)
+
+    # rotations: identity [1,0,0,0], (1, N, 4)
+    gs_rotations = torch.zeros((1, N, 4), device=device, dtype=points.dtype)
+    gs_rotations[..., 0] = 1.0
+
+    # opacities: per-view 2nd percentile threshold, vectorized
+    conf_flat = conf.reshape(b, h * w)
+    thresholds = torch.quantile(conf_flat, 0.02, dim=1, keepdim=True)  # (b, 1)
+    gs_opacities = (conf_flat >= thresholds).float().reshape(1, N)
+
+    return Gaussians(
+        means=gs_means,
+        scales=gs_scales,
+        rotations=gs_rotations,
+        harmonics=gs_harmonics,
+        opacities=gs_opacities,
+    )
+
+
+def infer_gaussian(prediction, scale_multiplier=1e-4):
+
+    points = prediction.world_points
+    if isinstance(points, np.ndarray):
+        points = torch.as_tensor(points, dtype=torch.float32, device="cuda")
+    else:
+        points = points.to(dtype=torch.float32, device="cuda")
+
+    return get_gaussians(
+        depths=prediction.depth.to(dtype=torch.float32, device="cuda"),
+        points=points,
+        images=prediction.processed_images.to(dtype=torch.float32, device="cuda"),
+        conf=prediction.conf.to(dtype=torch.float32, device="cuda"),
+        device=torch.device("cuda"),
+        scale_multiplier=scale_multiplier,
+    )
 
 
 if __name__ == "__main__":
